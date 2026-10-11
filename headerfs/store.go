@@ -122,6 +122,10 @@ type File interface {
 
 type headerFile struct {
 	file File
+
+	// blockLayout places the records of a block header file, whose
+	// headers need not all be the same size; nil for filter headers.
+	blockLayout *blockHeaderLayout
 }
 
 // truncateHeaders truncates one or more headers from the end of the header
@@ -152,15 +156,28 @@ func (h *headerFile) truncateHeaders(numHeaders uint32,
 	fileSize := fileInfo.Size()
 
 	// Calculate the total bytes to truncate based on number of headers.
-	headerTypeSize, err := headerType.Size()
-	if err != nil {
-		return err
-	}
-	truncateLength := int64(numHeaders) * int64(headerTypeSize)
+	var newSize int64
+	if h.blockLayout != nil {
+		count, err := h.blockLayout.count(fileSize)
+		if err != nil {
+			return err
+		}
+		if numHeaders > count {
+			return fmt.Errorf("cannot truncate %d headers from a "+
+				"file of %d", numHeaders, count)
+		}
+		newSize = int64(h.blockLayout.offset(count - numHeaders))
+	} else {
+		headerTypeSize, err := headerType.Size()
+		if err != nil {
+			return err
+		}
+		truncateLength := int64(numHeaders) * int64(headerTypeSize)
 
-	// Finally, we'll use both of these values to calculate the new size of
-	// the file and truncate it accordingly.
-	newSize := fileSize - truncateLength
+		// Finally, we'll use both of these values to calculate the
+		// new size of the file and truncate it accordingly.
+		newSize = fileSize - truncateLength
+	}
 
 	// On Windows, we need to close, truncate, and reopen the file.
 	if runtime.GOOS == "windows" {
@@ -262,6 +279,8 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	if err != nil {
 		return nil, err
 	}
+	layout := newBlockHeaderLayout(netParams)
+	hStore.blockLayout = &layout
 
 	// With the header store created, we'll fetch the file size to see if
 	// we need to initialize it with the first header or not.
@@ -298,7 +317,11 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 
 	// First, we'll compute the size of the current file so we can
 	// calculate the latest header written to disk.
-	fileHeight := uint32(fileInfo.Size()/80) - 1
+	fileCount, err := layout.count(fileInfo.Size())
+	if err != nil {
+		return nil, err
+	}
+	fileHeight := fileCount - 1
 
 	// Using the file's current height, fetch the latest on-disk header.
 	latestFileHeader, err := bhs.readHeader(fileHeight)
@@ -519,6 +542,10 @@ func (h *blockHeaderStore) WriteHeaders(hdrs ...BlockHeader) error {
 	// Next, we'll write out all the passed headers in series into the
 	// buffer we just extracted from the pool.
 	for _, header := range hdrs {
+		err := h.blockLayout.check(header.BlockHeader, header.Height)
+		if err != nil {
+			return err
+		}
 		if err := header.Serialize(headerBuf); err != nil {
 			return err
 		}

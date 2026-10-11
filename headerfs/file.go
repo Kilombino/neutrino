@@ -57,6 +57,14 @@ func (h *headerStore) readRaw(seekDist uint64) ([]byte, error) {
 		return nil, err
 	}
 
+	return h.readRawSize(seekDist, headerSize)
+}
+
+// readRawSize reads headerSize bytes from disk from a particular seek
+// distance.
+func (h *headerStore) readRawSize(seekDist uint64, headerSize int) ([]byte,
+	error) {
+
 	// TODO(roasbeef): add buffer pool
 
 	// With the number of bytes to read determined, we'll create a slice
@@ -80,14 +88,19 @@ func (h *headerStore) readRaw(seekDist uint64) ([]byte, error) {
 func (h *blockHeaderStore) readHeaderRange(startHeight uint32,
 	endHeight uint32) ([]wire.BlockHeader, error) {
 
-	// Based on the defined header type, we'll determine the number of
-	// bytes that we need to read from the file.
-	headerReader, err := readHeadersFromFile(
-		h.file, BlockHeaderSize, startHeight, endHeight,
-	)
-	if err != nil {
+	// The layout says where the range starts and ends; the headers
+	// within it say their own width as they are parsed.
+	if endHeight < startHeight {
+		return nil, fmt.Errorf("invalid header range %d-%d",
+			startHeight, endHeight)
+	}
+	start := h.blockLayout.offset(startHeight)
+	end := h.blockLayout.offset(endHeight + 1)
+	rawHeaderBytes := make([]byte, end-start)
+	if _, err := h.file.ReadAt(rawHeaderBytes, int64(start)); err != nil {
 		return nil, err
 	}
+	headerReader := bytes.NewReader(rawHeaderBytes)
 
 	// We'll now incrementally parse out the set of individual headers from
 	// our set of serialized contiguous raw headers.
@@ -110,13 +123,15 @@ func (h *blockHeaderStore) readHeaderRange(startHeight uint32,
 func (h *blockHeaderStore) readHeader(height uint32) (wire.BlockHeader, error) {
 	var header wire.BlockHeader
 
-	// Each header is 80 bytes, so using this information, we'll seek a
-	// distance to cover that height based on the size of block headers.
-	seekDistance := uint64(height) * 80
+	// The layout gives where the header at this height starts and how
+	// wide it is: 80 bytes, or 164 for a BLAKE2b (v2) header.
+	seekDistance := h.blockLayout.offset(height)
 
 	// With the distance calculated, we'll raw a raw header start from that
 	// offset.
-	rawHeader, err := h.readRaw(seekDistance)
+	rawHeader, err := h.readRawSize(
+		seekDistance, int(h.blockLayout.size(height)),
+	)
 	if err != nil {
 		return header, err
 	}
